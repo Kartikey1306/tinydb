@@ -457,6 +457,56 @@ def test_search_no_results_cache(db: TinyDB):
     assert len(db.search(where('missing').exists())) == 0
 
 
+def test_search_limit(db: TinyDB):
+    result = db.search(where('int') == 1, limit=2)
+
+    assert [doc['char'] for doc in result] == ['a', 'b']
+
+
+def test_search_offset(db: TinyDB):
+    result = db.search(where('int') == 1, offset=1)
+
+    assert [doc['char'] for doc in result] == ['b', 'c']
+
+
+def test_search_limit_and_offset(db: TinyDB):
+    result = db.search(where('int') == 1, limit=1, offset=1)
+
+    assert [doc.doc_id for doc in result] == [2]
+
+
+def test_search_offset_past_end(db: TinyDB):
+    assert db.search(where('int') == 1, offset=3) == []
+    assert db.search(where('int') == 1, limit=5, offset=10) == []
+
+
+def test_search_negative_offset(db: TinyDB):
+    with pytest.raises(ValueError):
+        db.search(where('int') == 1, offset=-1)
+
+
+def test_search_limit_stops_scan(db: TinyDB):
+    seen = []
+
+    def record(value):
+        seen.append(value)
+        return True
+
+    assert len(db.search(where('char').test(record), limit=1)) == 1
+
+    # The first document fills the page, so the others are never evaluated
+    assert seen == ['a']
+
+
+def test_search_page_served_from_cache(db: TinyDB):
+    query = where('int') == 1
+
+    # Warm the cache with the full result, then page through it
+    assert len(db.search(query)) == 3
+    assert [doc['char'] for doc in db.search(query, limit=2)] == ['a', 'b']
+    assert [doc['char'] for doc in db.search(query, offset=2)] == ['c']
+
+
 def test_get(db: TinyDB):
     item = db.get(where('char') == 'b')
     assert isinstance(item, Document)

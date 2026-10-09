@@ -408,6 +408,20 @@ In a similar manner you can look up the number of documents matching a query:
 >>> db.count(User.name == 'John')
 2
 
+Pagination
+^^^^^^^^^^
+
+When a query matches many documents you rarely need all of them at once.
+``search`` accepts ``limit`` and ``offset`` to return a single page of
+matches, in insertion order:
+
+>>> db.search(User.active == True, limit=25)             # first page
+>>> db.search(User.active == True, limit=25, offset=25)  # second page
+
+TinyDB stops scanning the table as soon as the page is complete, so fetching
+the first few pages of a large result set is much cheaper than slicing the
+full result list.
+
 Recap
 ^^^^^
 

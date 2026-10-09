@@ -394,6 +394,53 @@ def test_update_multiple_operation(db: TinyDB):
     assert db.count(where('int') == 2) == 2
 
 
+def test_update_multiple_generator(db: TinyDB):
+    # A generator can only be consumed once; every document must still be
+    # checked against every update, not just the first one
+    updates = (
+        ({'int': i}, where('char') == c) for i, c in enumerate('abc', 10)
+    )
+
+    assert db.update_multiple(updates) == [1, 2, 3]
+    assert [doc['int'] for doc in db.all()] == [10, 11, 12]
+
+
+def test_update_multiple_overlapping_conditions(db: TinyDB):
+    # Document 1 matches both conditions: both updates are applied, but its
+    # ID is reported once
+    updated = db.update_multiple([
+        ({'first': True}, where('char') == 'a'),
+        ({'second': True}, where('int') == 1),
+    ])
+
+    assert updated == [1, 2, 3]
+    assert db.get(doc_id=1) == {
+        'int': 1, 'char': 'a', 'first': True, 'second': True
+    }
+    assert db.count(where('second').exists()) == 3
+
+
+def test_update_multiple_sees_earlier_updates(db: TinyDB):
+    # Each condition is checked against the document as changed by the
+    # updates before it, so an update can enable or disable a later one
+    updated = db.update_multiple([
+        ({'int': 2}, where('char') == 'a'),
+        ({'flag': True}, where('int') == 2),
+        ({'other': True}, where('int') == 1),
+    ])
+
+    assert updated == [1, 2, 3]
+    assert db.get(doc_id=1) == {'int': 2, 'char': 'a', 'flag': True}
+    assert db.count(where('other').exists()) == 2
+
+
+def test_update_multiple_no_match(db: TinyDB):
+    # Nothing to apply, or nothing matching: no IDs and no changes
+    assert db.update_multiple(iter([])) == []
+    assert db.update_multiple([({'int': 9}, where('char') == 'z')]) == []
+    assert db.count(where('int') == 9) == 0
+
+
 def test_upsert(db: TinyDB):
     assert len(db) == 3
 

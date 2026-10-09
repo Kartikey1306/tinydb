@@ -537,8 +537,17 @@ class Table:
         """
         Update all matching documents to have a given set of fields.
 
+        Every ``(fields, cond)`` pair is checked against every document. A
+        document matching several conditions has each matching update
+        applied (in the given order) but is only reported once.
+
         :returns: a list containing the updated document's ID
         """
+
+        # ``updates`` is iterated once per document below, so it must be
+        # re-iterable. A generator would be exhausted after the first
+        # document and every later document would be silently skipped.
+        updates = list(updates)
 
         # Define the function that will perform the update
         def perform_update(fields, table, doc_id):
@@ -563,17 +572,23 @@ class Table:
             # result in an exception (RuntimeError: dictionary changed size
             # during iteration)
             for doc_id in list(table.keys()):
+                matched = False
+
                 for fields, cond in updates:
                     _cond = cast(QueryLike, cond)
 
                     # Pass through all documents to find documents matching the
                     # query. Call the processing callback with the document ID
                     if _cond(table[doc_id]):
-                        # Add ID to list of updated documents
-                        updated_ids.append(doc_id)
+                        matched = True
 
                         # Perform the update (see above)
                         perform_update(fields, table, doc_id)
+
+                # Add ID to list of updated documents, once per document even
+                # if more than one condition matched it
+                if matched:
+                    updated_ids.append(doc_id)
 
         # Perform the update operation (see _update_table for details)
         self._update_table(updater)

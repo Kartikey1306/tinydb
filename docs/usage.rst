@@ -341,6 +341,10 @@ You also can mix normal updates with update operations:
 ...     (delete('int'), where('char') == 'b'),
 ... ])
 
+Any iterable of ``(fields, query)`` pairs works, including a generator. If a
+document matches more than one query, each matching update is applied in the
+given order, and the document's ID appears once in the returned list.
+
 Data access and modification
 ----------------------------
 

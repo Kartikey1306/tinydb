@@ -2,6 +2,7 @@
 Contains the :class:`base class <tinydb.middlewares.Middleware>` for
 middlewares and implementations.
 """
+import functools
 import threading
 from typing import Optional
 
@@ -145,16 +146,23 @@ class CachingMiddleware(Middleware):
 
 class LockingMiddleware(Middleware):
     """
-    Make a storage safe to share between threads.
+    Make a database safe to share between threads.
 
     TinyDB itself does no locking. When several threads use the same TinyDB
     instance, their reads and writes interleave on the same storage, and
     with :class:`~tinydb.storages.JSONStorage` they even share a single file
     handle and cursor, which corrupts the database file.
 
-    This middleware serializes all access to the wrapped storage::
+    This middleware puts a reentrant lock in front of the storage::
 
         db = TinyDB('db.json', storage=LockingMiddleware(JSONStorage))
+
+    Tables find it through the storage's ``lock`` attribute and hold it for
+    each whole operation (``insert``, ``update``, ``search``, ...), since a
+    change is a read-modify-write of the entire table and locking single
+    reads and writes would still lose concurrent updates. Calls made on the
+    storage directly, including methods of wrapped middlewares like
+    ``flush()``, take the lock as well.
 
     It can be combined with other middlewares. Put it outermost so the lock
     also covers them::
@@ -169,16 +177,32 @@ class LockingMiddleware(Middleware):
         # Initialize the parent constructor
         super().__init__(storage_cls)
 
-        self._lock = threading.Lock()
+        #: Held by tables for the duration of each operation. Reentrant, as
+        #: those operations call ``read()`` and ``write()`` while holding it.
+        self.lock = threading.RLock()
 
     def read(self):
-        with self._lock:
+        with self.lock:
             return self.storage.read()
 
     def write(self, data):
-        with self._lock:
+        with self.lock:
             self.storage.write(data)
 
     def close(self):
-        with self._lock:
+        with self.lock:
             self.storage.close()
+
+    def __getattr__(self, name):
+        # Anything else forwarded to the wrapped storage (e.g.
+        # ``CachingMiddleware.flush``) must not bypass the lock either
+        attr = super().__getattr__(name)
+        if not callable(attr):
+            return attr
+
+        @functools.wraps(attr)
+        def locked(*args, **kwargs):
+            with self.lock:
+                return attr(*args, **kwargs)
+
+        return locked

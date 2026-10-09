@@ -697,8 +697,9 @@ LockingMiddleware
 ^^^^^^^^^^^^^^^^^
 
 TinyDB does no locking of its own. If several threads share one ``TinyDB``
-instance, wrap the storage in a ``LockingMiddleware`` so their reads and
-writes don't interleave:
+instance, wrap the storage in a ``LockingMiddleware``. Each operation
+(``insert``, ``update``, ``search``, ...) then runs while holding its lock,
+so concurrent changes are never lost or interleaved:
 
 >>> from tinydb.middlewares import LockingMiddleware
 >>> db = TinyDB('/path/to/db.json', storage=LockingMiddleware(JSONStorage))

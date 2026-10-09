@@ -132,7 +132,7 @@ details.
 ----------------------
 
 .. automodule:: tinydb.middlewares
-    :members: CachingMiddleware
+    :members: CachingMiddleware, LockingMiddleware
     :special-members:
     :exclude-members: __weakref__
 

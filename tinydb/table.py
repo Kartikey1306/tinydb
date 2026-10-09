@@ -3,10 +3,15 @@ This module implements tables, the central place for accessing and manipulating
 data in TinyDB.
 """
 
+import functools
 from collections.abc import Callable, Iterable, Iterator, Mapping, MutableMapping
+from contextlib import AbstractContextManager, nullcontext
 from typing import (
+    Concatenate,
     NoReturn,
     Optional,
+    ParamSpec,
+    TypeVar,
     Union,
     cast,
     overload
@@ -17,6 +22,23 @@ from .storages import Storage
 from .utils import LRUCache
 
 __all__ = ('Document', 'Table')
+
+P = ParamSpec('P')
+R = TypeVar('R')
+
+
+def _locked(
+    method: Callable[Concatenate['Table', P], R]
+) -> Callable[Concatenate['Table', P], R]:
+    """
+    Run a table operation while holding the storage's lock, if it has one.
+    """
+    @functools.wraps(method)
+    def wrapper(self: 'Table', *args: P.args, **kwargs: P.kwargs) -> R:
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    return wrapper
 
 
 class Document(dict):
@@ -107,6 +129,17 @@ class Table:
         self._query_cache: LRUCache[QueryLike, list[Document]] \
             = self.query_cache_class(capacity=cache_size)
 
+        # Storages meant to be shared between threads (see LockingMiddleware)
+        # expose a reentrant ``lock``. We hold it for each whole operation:
+        # locking the storage's individual reads and writes isn't enough,
+        # since every change is a read-modify-write of the whole table and
+        # new document IDs are picked from the current state.
+        lock = getattr(storage, 'lock', None)
+        self._shared = lock is not None
+        self._lock: AbstractContextManager = (
+            lock if lock is not None else nullcontext()
+        )
+
         self._next_id: Optional[int] = None
         # Only persist a brand-new empty table. Never clear existing documents
         # when reopen/construct with persist_empty=True (see issue #636).
@@ -136,6 +169,7 @@ class Table:
         """
         return self._storage
 
+    @_locked
     def insert(self, document: Mapping) -> int:
         """
         Insert a new document into the table.
@@ -176,6 +210,7 @@ class Table:
 
         return doc_id
 
+    @_locked
     def insert_multiple(self, documents: Iterable[Mapping]) -> list[int]:
         """
         Insert multiple documents into the table.
@@ -246,6 +281,7 @@ class Table:
 
         return list(iter(self))
 
+    @_locked
     def search(self, cond: QueryLike) -> list[Document]:
         """
         Search for all documents matching a 'where' cond.
@@ -356,50 +392,54 @@ class Table:
         :returns: a document, ``None``, or a list of documents when
                   ``doc_ids`` is used
         """
-        table = self._read_table()
+        # Locked inside rather than with @_locked, which would hide the
+        # overloads above from type checkers
+        with self._lock:
+            table = self._read_table()
 
-        if doc_id is not None:
-            # Retrieve a document specified by its ID
-            raw_doc = table.get(str(doc_id), None)
+            if doc_id is not None:
+                # Retrieve a document specified by its ID
+                raw_doc = table.get(str(doc_id), None)
 
-            if raw_doc is None:
+                if raw_doc is None:
+                    return None
+
+                # Convert the raw data to the document class
+                return self.document_class(raw_doc, doc_id)
+
+            elif doc_ids is not None:
+                # Filter the table by extracting out all those documents which
+                # have doc id specified in the doc_id list.
+
+                # Since document IDs will be unique, we make it a set to ensure
+                # constant time lookup
+                doc_ids_set = set(str(doc_id) for doc_id in doc_ids)
+
+                # Now return the filtered documents in form of list
+                return [
+                    self.document_class(doc, self.document_id_class(doc_id))
+                    for doc_id, doc in table.items()
+                    if doc_id in doc_ids_set
+                ]
+
+            elif cond is not None:
+                # Find a document specified by a query
+                # The trailing underscore in doc_id_ is needed so MyPy
+                # doesn't think that `doc_id_` (which is a string) needs
+                # to have the same type as `doc_id` which is this function's
+                # parameter and is an optional `int`.
+                for doc_id_, doc in self._read_table().items():
+                    if cond(doc):
+                        return self.document_class(
+                            doc,
+                            self.document_id_class(doc_id_)
+                        )
+
                 return None
 
-            # Convert the raw data to the document class
-            return self.document_class(raw_doc, doc_id)
+            raise RuntimeError('You have to pass either cond or doc_id or doc_ids')
 
-        elif doc_ids is not None:
-            # Filter the table by extracting out all those documents which
-            # have doc id specified in the doc_id list.
-
-            # Since document IDs will be unique, we make it a set to ensure
-            # constant time lookup
-            doc_ids_set = set(str(doc_id) for doc_id in doc_ids)
-
-            # Now return the filtered documents in form of list
-            return [
-                self.document_class(doc, self.document_id_class(doc_id))
-                for doc_id, doc in table.items()
-                if doc_id in doc_ids_set
-            ]
-
-        elif cond is not None:
-            # Find a document specified by a query
-            # The trailing underscore in doc_id_ is needed so MyPy
-            # doesn't think that `doc_id_` (which is a string) needs
-            # to have the same type as `doc_id` which is this function's
-            # parameter and is an optional `int`.
-            for doc_id_, doc in self._read_table().items():
-                if cond(doc):
-                    return self.document_class(
-                        doc,
-                        self.document_id_class(doc_id_)
-                    )
-
-            return None
-
-        raise RuntimeError('You have to pass either cond or doc_id or doc_ids')
-
+    @_locked
     def contains(
         self,
         cond: Optional[QueryLike] = None,
@@ -424,6 +464,7 @@ class Table:
 
         raise RuntimeError('You have to pass either cond or doc_id')
 
+    @_locked
     def update(
         self,
         fields: Union[Mapping, Callable[[MutableMapping], None]],
@@ -528,6 +569,7 @@ class Table:
 
             return updated_ids
 
+    @_locked
     def update_multiple(
         self,
         updates: Iterable[
@@ -580,6 +622,7 @@ class Table:
 
         return updated_ids
 
+    @_locked
     def upsert(self, document: Mapping, cond: Optional[QueryLike] = None) -> list[int]:
         """
         Update documents, if they exist, insert them otherwise.
@@ -622,6 +665,7 @@ class Table:
         # data as a new document
         return [self.insert(document)]
 
+    @_locked
     def remove(
         self,
         cond: Optional[QueryLike] = None,
@@ -695,6 +739,7 @@ class Table:
 
         raise RuntimeError('Use truncate() to remove all documents')
 
+    @_locked
     def truncate(self) -> None:
         """
         Truncate the table by removing all documents.
@@ -715,6 +760,7 @@ class Table:
 
         return len(self.search(cond))
 
+    @_locked
     def clear_cache(self) -> None:
         """
         Clear the query cache.
@@ -722,6 +768,7 @@ class Table:
 
         self._query_cache.clear()
 
+    @_locked
     def __len__(self):
         """
         Count the total number of documents in this table.
@@ -735,6 +782,18 @@ class Table:
 
         :returns: an iterator over all documents.
         """
+
+        if self._shared:
+            # Other threads may change documents while we iterate, so copy
+            # them all while holding the lock
+            with self._lock:
+                docs = [
+                    self.document_class(doc, self.document_id_class(doc_id))
+                    for doc_id, doc in self._read_table().items()
+                ]
+
+            yield from docs
+            return
 
         # Iterate all documents and their IDs
         for doc_id, doc in self._read_table().items():
@@ -801,6 +860,7 @@ class Table:
 
         return table
 
+    @_locked
     def _update_table(self, updater: Callable[[dict[int, Mapping]], None]):
         """
         Perform a table update operation.

@@ -1,9 +1,13 @@
 import os
+import threading
+import time
 
 import pytest
 
-from tinydb import TinyDB
-from tinydb.middlewares import CachingMiddleware
+from tinydb import TinyDB, where
+from tinydb.middlewares import CachingMiddleware, LockingMiddleware
+from tinydb.operations import increment
+from tinydb.table import Table
 from tinydb.storages import MemoryStorage, JSONStorage
 
 doc = {'none': [None, None], 'int': 42, 'float': 3.1415899999999999,
@@ -121,3 +125,160 @@ def test_caching_rejects_use_after_close(tmpdir):
 
     with TinyDB(path, storage=CachingMiddleware(JSONStorage)) as reopened:
         assert reopened.all() == [{'key': 'value'}]
+
+
+def test_locking_read_write():
+    db = TinyDB(storage=LockingMiddleware(MemoryStorage))
+    db.insert({'key': 'value'})
+
+    assert db.all() == [{'key': 'value'}]
+
+
+def test_locking_nested_with_caching(tmpdir):
+    path = str(tmpdir.join('locked.db'))
+
+    with TinyDB(path,
+                storage=LockingMiddleware(CachingMiddleware(JSONStorage))) as db:
+        db.insert({'key': 'value'})
+
+    with TinyDB(path) as db:
+        assert db.all() == [{'key': 'value'}]
+
+
+def test_locking_concurrent_readers_and_writer(tmpdir):
+    # Without the lock, readers move the shared JSONStorage file cursor
+    # while the writer is writing, which corrupts reads and the file itself
+    path = str(tmpdir.join('locked.db'))
+    db = TinyDB(path, storage=LockingMiddleware(JSONStorage))
+    db.insert_multiple({'n': i} for i in range(100))
+
+    errors = []
+    done = threading.Event()
+
+    def reader():
+        while not done.is_set():
+            try:
+                assert len(db.all()) >= 100
+            except Exception as e:  # pragma: no cover
+                errors.append(e)
+
+    def writer():
+        try:
+            for i in range(100):
+                db.insert({'n': 100 + i})
+        except Exception as e:  # pragma: no cover
+            errors.append(e)
+        finally:
+            # Always release the readers, or a failing writer hangs the test
+            done.set()
+
+    threads = [threading.Thread(target=reader) for _ in range(4)]
+    threads.append(threading.Thread(target=writer))
+
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+    assert len(db) == 200
+    db.close()
+
+    with TinyDB(path) as reopened:
+        assert len(reopened) == 200
+
+
+def _run_threads(target, count):
+    errors = []
+
+    def run(n):
+        try:
+            target(n)
+        except Exception as e:  # pragma: no cover
+            errors.append(e)
+
+    threads = [threading.Thread(target=run, args=(n,)) for n in range(count)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    return errors
+
+
+def test_locking_concurrent_writers(tmpdir):
+    # Every change is a read-modify-write of the whole table, so writers
+    # must not interleave, and each insert must get its own document ID
+    path = str(tmpdir.join('locked.db'))
+    db = TinyDB(path, storage=LockingMiddleware(JSONStorage))
+
+    def writer(n):
+        table = db.table('even' if n % 2 == 0 else 'odd')
+        for i in range(100):
+            table.insert({'writer': n, 'i': i})
+
+    assert _run_threads(writer, 4) == []
+
+    for name in ('even', 'odd'):
+        docs = db.table(name).all()
+        assert len(docs) == 200
+        assert len({doc.doc_id for doc in docs}) == 200
+
+    db.close()
+
+
+def test_locking_concurrent_updates(tmpdir):
+    # JSONStorage hands out fresh objects on every read, so an update based
+    # on a stale read really is lost (MemoryStorage would hide this)
+    path = str(tmpdir.join('locked.db'))
+    db = TinyDB(path, storage=LockingMiddleware(JSONStorage))
+    db.insert({'name': 'counter', 'count': 0})
+
+    def incrementer(n):
+        for _ in range(100):
+            db.update(increment('count'), where('name') == 'counter')
+
+    assert _run_threads(incrementer, 4) == []
+    assert db.get(where('name') == 'counter')['count'] == 400
+    db.close()
+
+
+def test_locking_covers_forwarded_methods():
+    storage = LockingMiddleware(CachingMiddleware(MemoryStorage))
+    db = TinyDB(storage=storage)
+    db.insert({'key': 'value'})
+
+    flushed = threading.Event()
+
+    def flush():
+        db.storage.flush()
+        flushed.set()
+
+    # flush() is forwarded to the CachingMiddleware, but must still wait
+    # for the lock
+    with storage.lock:
+        thread = threading.Thread(target=flush)
+        thread.start()
+        assert not flushed.wait(0.2)
+
+    thread.join()
+    assert flushed.is_set()
+    assert storage.storage.storage.memory == {'_default': {'1': {'key': 'value'}}}
+
+
+def test_locking_table_creation():
+    # A slow Table constructor widens the window between "is this table
+    # known?" and "remember it", so unlocked threads would each create one
+    class SlowTable(Table):
+        def __init__(self, *args, **kwargs):
+            time.sleep(0.05)
+            super().__init__(*args, **kwargs)
+
+    class SlowDB(TinyDB):
+        table_class = SlowTable
+
+    db = SlowDB(storage=LockingMiddleware(MemoryStorage))
+    tables = []
+
+    assert _run_threads(lambda n: tables.append(db.table('shared')), 4) == []
+    assert len({id(table) for table in tables}) == 1

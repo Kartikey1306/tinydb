@@ -142,7 +142,9 @@ class JSONStorage(Storage):
         # it is reopened read-only. Reopening in a 'w' mode would truncate
         # the file we just wrote.
         self._read_mode = 'rb' if 'b' in access_mode else 'r'
-        self._warned_in_place = False
+        # Cleared once a swap turns out to be impossible for this file, so
+        # later writes go straight to the in-place fallback
+        self._can_replace = True
 
         if access_mode not in ('r', 'rb', 'r+', 'rb+'):
             warnings.warn(
@@ -219,8 +221,20 @@ class JSONStorage(Storage):
         # state to a temporary file first, make sure it has reached the disk
         # and then swap it in with os.replace(), which is atomic. The file
         # always holds either the complete old or the complete new state.
-        if not self._write_atomically(serialized):
-            self._write_in_place(serialized)
+        if self._can_replace:
+            if self._write_atomically(serialized):
+                return
+
+            # Don't pay for a temporary file on every write from now on
+            self._can_replace = False
+            warnings.warn(
+                'Cannot replace {!r} atomically (its directory is not '
+                'writable, or it is a mount point). Writing in place instead, '
+                'so a crash during a write can corrupt it.'.format(self._path),
+                RuntimeWarning,
+            )
+
+        self._write_in_place(serialized)
 
     def _write_atomically(self, serialized: str) -> bool:
         """
@@ -307,18 +321,8 @@ class JSONStorage(Storage):
         """
         Overwrite the database file directly, for when it can't be replaced.
 
-        This is how all writes used to work. It isn't crash safe, so warn
-        about it (once per storage).
+        This is how all writes used to work. It isn't crash safe.
         """
-        if not self._warned_in_place:
-            warnings.warn(
-                'Cannot replace {!r} atomically (its directory is not '
-                'writable, or it is a mount point). Writing in place instead, '
-                'so a crash during a write can corrupt it.'.format(self._path),
-                RuntimeWarning,
-            )
-            self._warned_in_place = True
-
         with open(self._target, 'r+', encoding=self._encoding) as f:
             f.write(serialized)
             f.flush()

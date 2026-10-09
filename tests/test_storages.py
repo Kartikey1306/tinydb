@@ -4,6 +4,7 @@ import os
 import random
 import stat
 import tempfile
+import warnings
 
 import pytest
 
@@ -257,16 +258,24 @@ def test_json_mount_point_falls_back_to_in_place(tmpdir, monkeypatch):
     storage.write(doc)
 
     # What os.replace() raises when the target is a bind-mounted file
+    attempts = []
+
     def busy(src, dst):
+        attempts.append(src)
         raise OSError(errno.EBUSY, os.strerror(errno.EBUSY))
 
     monkeypatch.setattr(os, 'replace', busy)
     with pytest.warns(RuntimeWarning, match='atomically'):
         storage.write({'_default': {}})
 
-    # Only warns once per storage
-    storage.write({'_default': {'1': {'a': 1}}})
+    # Later writes go straight to the fallback: no new temp file, no
+    # repeated swap attempt and no repeated warning
+    with warnings.catch_warnings():
+        warnings.simplefilter('error')
+        storage.write({'_default': {'1': {'a': 1}}})
     monkeypatch.undo()
+
+    assert len(attempts) == 1
 
     assert storage.read() == {'_default': {'1': {'a': 1}}}
     assert os.listdir(str(tmpdir)) == ['test.db']

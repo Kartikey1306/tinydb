@@ -15,6 +15,10 @@ from typing import Any, Optional
 
 __all__ = ('Storage', 'JSONStorage', 'MemoryStorage')
 
+# Why JSONStorage couldn't swap in a new file (see JSONStorage.write)
+_MOUNT_POINT = 'it is a mount point'
+_DIRECTORY_NOT_WRITABLE = 'its directory is not writable'
+
 
 def _fsync_directory(path: str) -> None:
     """
@@ -142,9 +146,10 @@ class JSONStorage(Storage):
         # it is reopened read-only. Reopening in a 'w' mode would truncate
         # the file we just wrote.
         self._read_mode = 'rb' if 'b' in access_mode else 'r'
-        # Cleared once a swap turns out to be impossible for this file, so
-        # later writes go straight to the in-place fallback
+        # Cleared once the file turns out to be a mount point, which can never
+        # be replaced, so later writes go straight to the in-place fallback
         self._can_replace = True
+        self._warned_in_place = False
 
         if access_mode not in ('r', 'rb', 'r+', 'rb+'):
             warnings.warn(
@@ -221,27 +226,39 @@ class JSONStorage(Storage):
         # state to a temporary file first, make sure it has reached the disk
         # and then swap it in with os.replace(), which is atomic. The file
         # always holds either the complete old or the complete new state.
+        reason: Optional[str] = _MOUNT_POINT
         if self._can_replace:
-            if self._write_atomically(serialized):
+            reason = self._write_atomically(serialized)
+            if reason is None:
                 return
 
-            # Don't pay for a temporary file on every write from now on
-            self._can_replace = False
+            # A mount point stays one, so don't pay for a temporary file on
+            # every write from now on. A read-only directory may become
+            # writable again, and failing to create a file there is cheap,
+            # so keep trying in that case.
+            if reason == _MOUNT_POINT:
+                self._can_replace = False
+
+        # Warn (once) before writing anything: if warnings are turned into
+        # errors, the write is refused every time instead of silently going
+        # ahead in place on the next attempt
+        if not self._warned_in_place:
             warnings.warn(
-                'Cannot replace {!r} atomically (its directory is not '
-                'writable, or it is a mount point). Writing in place instead, '
-                'so a crash during a write can corrupt it.'.format(self._path),
+                'Cannot replace {!r} atomically ({}). Writing in place '
+                'instead, so a crash during a write can corrupt it.'.format(
+                    self._path, reason),
                 RuntimeWarning,
             )
+            self._warned_in_place = True
 
         self._write_in_place(serialized)
 
-    def _write_atomically(self, serialized: str) -> bool:
+    def _write_atomically(self, serialized: str) -> Optional[str]:
         """
         Swap in a new file holding ``serialized``.
 
-        Returns ``False`` if the database file can't be replaced, in which
-        case nothing has been changed.
+        Returns ``None`` on success. If the database file can't be replaced,
+        returns why, and nothing has been changed.
         """
         # The temporary file has to be in the same directory: os.replace()
         # can't move files between filesystems. mkstemp() gives it a unique,
@@ -257,7 +274,7 @@ class JSONStorage(Storage):
             )
         except PermissionError:
             # The database file is writable, but its directory isn't
-            return False
+            return _DIRECTORY_NOT_WRITABLE
 
         try:
             with open(fd, 'w', encoding=self._encoding) as tmp:
@@ -284,14 +301,14 @@ class JSONStorage(Storage):
             # A database file that is a mount point (like a single-file Docker
             # bind mount) can be written to, but not replaced
             if isinstance(e, OSError) and e.errno in (errno.EBUSY, errno.EXDEV):
-                return False
+                return _MOUNT_POINT
 
             raise
 
         # Make the rename itself durable, not just the file contents
         _fsync_directory(directory)
 
-        return True
+        return None
 
     def _copy_metadata(self, tmp_path: str) -> None:
         """

@@ -235,20 +235,35 @@ def test_json_write_keeps_group(tmpdir):
 
 @pytest.mark.skipif(os.name == 'nt' or os.geteuid() == 0,
                     reason='POSIX permissions, not as root')
-def test_json_unwritable_directory_falls_back_to_in_place(tmpdir):
+def test_json_unwritable_directory_falls_back_to_in_place(tmpdir, monkeypatch):
     path = str(tmpdir.join('test.db'))
     storage = JSONStorage(path)
     storage.write(doc)
 
     os.chmod(str(tmpdir), 0o500)
     try:
-        with pytest.warns(RuntimeWarning, match='atomically'):
+        with pytest.warns(RuntimeWarning, match='not writable'):
             storage.write({'_default': {}})
     finally:
         os.chmod(str(tmpdir), 0o700)
 
     assert storage.read() == {'_default': {}}
     assert os.listdir(str(tmpdir)) == ['test.db']
+
+    # Once the directory is writable again, writes are atomic again
+    replaced = []
+    real_replace = os.replace
+
+    def recording_replace(src, dst):
+        replaced.append(src)
+        real_replace(src, dst)
+
+    monkeypatch.setattr(os, 'replace', recording_replace)
+    storage.write(doc)
+    monkeypatch.undo()
+
+    assert len(replaced) == 1
+    assert storage.read() == doc
     storage.close()
 
 
@@ -265,7 +280,7 @@ def test_json_mount_point_falls_back_to_in_place(tmpdir, monkeypatch):
         raise OSError(errno.EBUSY, os.strerror(errno.EBUSY))
 
     monkeypatch.setattr(os, 'replace', busy)
-    with pytest.warns(RuntimeWarning, match='atomically'):
+    with pytest.warns(RuntimeWarning, match='mount point'):
         storage.write({'_default': {}})
 
     # Later writes go straight to the fallback: no new temp file, no
@@ -279,6 +294,29 @@ def test_json_mount_point_falls_back_to_in_place(tmpdir, monkeypatch):
 
     assert storage.read() == {'_default': {'1': {'a': 1}}}
     assert os.listdir(str(tmpdir)) == ['test.db']
+    storage.close()
+
+
+def test_json_fallback_refused_when_warnings_are_errors(tmpdir, monkeypatch):
+    path = str(tmpdir.join('test.db'))
+    storage = JSONStorage(path)
+    storage.write(doc)
+
+    def busy(src, dst):
+        raise OSError(errno.EBUSY, os.strerror(errno.EBUSY))
+
+    monkeypatch.setattr(os, 'replace', busy)
+
+    # With warnings as errors, falling back to a non-atomic write is refused,
+    # and keeps being refused rather than quietly going ahead next time
+    with warnings.catch_warnings():
+        warnings.simplefilter('error')
+        for _ in range(2):
+            with pytest.raises(RuntimeWarning):
+                storage.write({'_default': {}})
+    monkeypatch.undo()
+
+    assert storage.read() == doc
     storage.close()
 
 

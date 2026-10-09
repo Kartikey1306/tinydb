@@ -162,10 +162,10 @@ def test_json_failed_replace_keeps_storage_usable(tmpdir, monkeypatch):
     storage = JSONStorage(path)
     storage.write(doc)
 
-    def cross_device(src, dst):
-        raise OSError(errno.EXDEV, os.strerror(errno.EXDEV))
+    def failing_replace(src, dst):
+        raise OSError(errno.EIO, os.strerror(errno.EIO))
 
-    monkeypatch.setattr(os, 'replace', cross_device)
+    monkeypatch.setattr(os, 'replace', failing_replace)
     with pytest.raises(OSError):
         storage.write({'_default': {}})
     monkeypatch.undo()
@@ -191,12 +191,13 @@ def test_json_temp_file_next_to_database(tmpdir, monkeypatch):
 
     monkeypatch.setattr(os, 'replace', recording_replace)
     storage.write(doc)
+    storage.write(doc)
     storage.close()
 
     # Same directory (and so the same filesystem) as the database, with a
-    # name that isn't predictable
-    assert os.path.dirname(sources[0]) == str(tmpdir)
-    assert sources[0] != path + '.tmp'
+    # fresh name for every write
+    assert [os.path.dirname(src) for src in sources] == [str(tmpdir)] * 2
+    assert sources[0] != sources[1]
 
 
 @pytest.mark.skipif(os.name == 'nt', reason='POSIX permissions')
@@ -210,6 +211,65 @@ def test_json_write_keeps_file_mode(tmpdir):
         storage.write(doc)
         assert stat.S_IMODE(os.stat(path).st_mode) == mode
 
+    storage.close()
+
+
+@pytest.mark.skipif(os.name == 'nt', reason='POSIX groups')
+def test_json_write_keeps_group(tmpdir):
+    path = str(tmpdir.join('test.db'))
+    storage = JSONStorage(path)
+    storage.write(doc)
+
+    current = os.stat(path).st_gid
+    others = [gid for gid in os.getgroups() if gid != current]
+    if not others:
+        pytest.skip('needs membership in a second group')
+
+    os.chown(path, -1, others[0])
+    storage.write(doc)
+    storage.close()
+
+    assert os.stat(path).st_gid == others[0]
+
+
+@pytest.mark.skipif(os.name == 'nt' or os.geteuid() == 0,
+                    reason='POSIX permissions, not as root')
+def test_json_unwritable_directory_falls_back_to_in_place(tmpdir):
+    path = str(tmpdir.join('test.db'))
+    storage = JSONStorage(path)
+    storage.write(doc)
+
+    os.chmod(str(tmpdir), 0o500)
+    try:
+        with pytest.warns(RuntimeWarning, match='atomically'):
+            storage.write({'_default': {}})
+    finally:
+        os.chmod(str(tmpdir), 0o700)
+
+    assert storage.read() == {'_default': {}}
+    assert os.listdir(str(tmpdir)) == ['test.db']
+    storage.close()
+
+
+def test_json_mount_point_falls_back_to_in_place(tmpdir, monkeypatch):
+    path = str(tmpdir.join('test.db'))
+    storage = JSONStorage(path)
+    storage.write(doc)
+
+    # What os.replace() raises when the target is a bind-mounted file
+    def busy(src, dst):
+        raise OSError(errno.EBUSY, os.strerror(errno.EBUSY))
+
+    monkeypatch.setattr(os, 'replace', busy)
+    with pytest.warns(RuntimeWarning, match='atomically'):
+        storage.write({'_default': {}})
+
+    # Only warns once per storage
+    storage.write({'_default': {'1': {'a': 1}}})
+    monkeypatch.undo()
+
+    assert storage.read() == {'_default': {'1': {'a': 1}}}
+    assert os.listdir(str(tmpdir)) == ['test.db']
     storage.close()
 
 

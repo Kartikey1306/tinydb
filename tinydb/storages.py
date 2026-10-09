@@ -4,9 +4,10 @@ implementations.
 """
 
 import contextlib
+import errno
 import json
 import os
-import shutil
+import stat
 import tempfile
 import warnings
 from abc import ABC, abstractmethod
@@ -141,6 +142,7 @@ class JSONStorage(Storage):
         # it is reopened read-only. Reopening in a 'w' mode would truncate
         # the file we just wrote.
         self._read_mode = 'rb' if 'b' in access_mode else 'r'
+        self._warned_in_place = False
 
         if access_mode not in ('r', 'rb', 'r+', 'rb+'):
             warnings.warn(
@@ -217,18 +219,31 @@ class JSONStorage(Storage):
         # state to a temporary file first, make sure it has reached the disk
         # and then swap it in with os.replace(), which is atomic. The file
         # always holds either the complete old or the complete new state.
-        #
+        if not self._write_atomically(serialized):
+            self._write_in_place(serialized)
+
+    def _write_atomically(self, serialized: str) -> bool:
+        """
+        Swap in a new file holding ``serialized``.
+
+        Returns ``False`` if the database file can't be replaced, in which
+        case nothing has been changed.
+        """
         # The temporary file has to be in the same directory: os.replace()
         # can't move files between filesystems. mkstemp() gives it a unique,
         # unpredictable name and creates it exclusively, so two databases
         # never share a temporary file and nothing can be planted in its
         # place.
         directory = os.path.dirname(self._target)
-        fd, tmp_path = tempfile.mkstemp(
-            dir=directory,
-            prefix='.{}.'.format(os.path.basename(self._target)),
-            suffix='.tmp',
-        )
+        try:
+            fd, tmp_path = tempfile.mkstemp(
+                dir=directory,
+                prefix='.{}.'.format(os.path.basename(self._target)),
+                suffix='.tmp',
+            )
+        except PermissionError:
+            # The database file is writable, but its directory isn't
+            return False
 
         try:
             with open(fd, 'w', encoding=self._encoding) as tmp:
@@ -236,10 +251,7 @@ class JSONStorage(Storage):
                 tmp.flush()
                 os.fsync(tmp.fileno())
 
-            # mkstemp() creates the file as 0600. Carry over the database's
-            # permissions so that the swap doesn't change them.
-            with contextlib.suppress(FileNotFoundError):
-                shutil.copymode(self._target, tmp_path)
+            self._copy_metadata(tmp_path)
 
             # Windows refuses to replace a file that is still open, so release
             # our handle for the swap. Reopen it whether or not the swap
@@ -250,14 +262,71 @@ class JSONStorage(Storage):
             finally:
                 self._handle = open(self._target, mode=self._read_mode,
                                     encoding=self._encoding)
-        except BaseException:
+        except BaseException as e:
             # Don't leave a stray temporary file behind
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(tmp_path)
+
+            # A database file that is a mount point (like a single-file Docker
+            # bind mount) can be written to, but not replaced
+            if isinstance(e, OSError) and e.errno in (errno.EBUSY, errno.EXDEV):
+                return False
+
             raise
 
         # Make the rename itself durable, not just the file contents
         _fsync_directory(directory)
+
+        return True
+
+    def _copy_metadata(self, tmp_path: str) -> None:
+        """
+        Give the temporary file the database file's owner, group and mode.
+
+        mkstemp() creates it as 0600 and owned by us. Changing the owner
+        needs root and changing the group needs membership in it, so both are
+        best effort.
+        """
+        try:
+            st = os.stat(self._target)
+        except FileNotFoundError:
+            return
+
+        # chown() may clear setuid/setgid bits, so it goes first
+        if hasattr(os, 'chown'):
+            for uid, gid in ((st.st_uid, st.st_gid), (-1, st.st_gid)):
+                try:
+                    os.chown(tmp_path, uid, gid)
+                    break
+                except OSError:
+                    continue
+
+        os.chmod(tmp_path, stat.S_IMODE(st.st_mode))
+
+    def _write_in_place(self, serialized: str) -> None:
+        """
+        Overwrite the database file directly, for when it can't be replaced.
+
+        This is how all writes used to work. It isn't crash safe, so warn
+        about it (once per storage).
+        """
+        if not self._warned_in_place:
+            warnings.warn(
+                'Cannot replace {!r} atomically (its directory is not '
+                'writable, or it is a mount point). Writing in place instead, '
+                'so a crash during a write can corrupt it.'.format(self._path),
+                RuntimeWarning,
+            )
+            self._warned_in_place = True
+
+        with open(self._target, 'r+', encoding=self._encoding) as f:
+            f.write(serialized)
+            f.flush()
+            os.fsync(f.fileno())
+
+            # Remove data that is behind the new cursor in case the file has
+            # gotten shorter
+            f.truncate()
 
 
 class MemoryStorage(Storage):

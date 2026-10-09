@@ -485,6 +485,37 @@ def test_search_negative_offset(db: TinyDB):
         db.search(where('int') == 1, offset=-1)
 
 
+def test_search_limit_zero(db: TinyDB):
+    assert db.search(where('int') == 1, limit=0) == []
+    assert len(db.search(where('int') == 1)) == 3
+
+
+def test_search_negative_limit(db: TinyDB):
+    with pytest.raises(ValueError):
+        db.search(where('int') == 1, limit=-1)
+
+
+def test_search_partial_page_not_cached(db: TinyDB):
+    query = where('int') == 1
+
+    # The first page stops the scan early, so it must not be cached as if
+    # it were the whole result
+    assert [doc['char'] for doc in db.search(query, limit=1)] == ['a']
+    assert query not in db._query_cache
+
+    assert [doc['char'] for doc in db.search(query, limit=1, offset=1)] == ['b']
+    assert len(db.search(query)) == 3
+    assert db.count(query) == 3
+
+
+def test_search_page_covering_all_matches_is_cached(db: TinyDB):
+    query = where('int') == 1
+
+    # A page large enough to need the whole table is a complete result
+    assert len(db.search(query, limit=10)) == 3
+    assert query in db._query_cache
+
+
 def test_search_limit_stops_scan(db: TinyDB):
     seen = []
 

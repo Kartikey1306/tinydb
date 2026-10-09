@@ -276,10 +276,12 @@ class Table:
         """
         if offset < 0:
             raise ValueError('offset must not be negative')
+        if limit is not None and limit < 0:
+            raise ValueError('limit must not be negative')
 
         # Index just past the last match the caller asked for. We never need
         # to look further than this.
-        end = offset + limit if limit else None
+        end = offset + limit if limit is not None else None
 
         # First, we check the query cache to see if it has results for this
         # query
@@ -291,15 +293,23 @@ class Table:
         # insertion order. Only matching documents are converted to the
         # document class and document ID class, and we stop once the
         # requested page is filled.
-        docs = []
+        docs: list[Document] = []
+
+        # Whether every document was looked at. A scan that stopped early
+        # only holds the first ``end`` matches, so it must not end up in the
+        # query cache, where later searches would take it for the full
+        # result.
+        complete = True
+
         for doc_id, doc in self._read_table().items():
+            if end is not None and len(docs) >= end:
+                complete = False
+                break
+
             if cond(doc):
                 docs.append(
                     self.document_class(doc, self.document_id_class(doc_id))
                 )
-
-                if end is not None and len(docs) >= end:
-                    break
 
         # Only cache cacheable queries.
         #
@@ -316,7 +326,7 @@ class Table:
         # are cacheable.
         is_cacheable: Callable[[], bool] = getattr(cond, 'is_cacheable',
                                                    lambda: True)
-        if is_cacheable():
+        if complete and is_cacheable():
             # Update the query cache
             self._query_cache[cond] = docs[:]
 

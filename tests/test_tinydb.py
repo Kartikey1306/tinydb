@@ -490,6 +490,17 @@ def test_search_limit_zero(db: TinyDB):
     assert len(db.search(where('int') == 1)) == 3
 
 
+def test_search_limit_zero_skips_scan(db: TinyDB):
+    seen = []
+
+    def record(value):
+        seen.append(value)
+        return True
+
+    assert db.search(where('char').test(record), limit=0, offset=2) == []
+    assert seen == []
+
+
 def test_search_negative_limit(db: TinyDB):
     with pytest.raises(ValueError):
         db.search(where('int') == 1, limit=-1)

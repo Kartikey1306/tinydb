@@ -278,6 +278,9 @@ class Table:
             raise ValueError('offset must not be negative')
         if limit is not None and limit < 0:
             raise ValueError('limit must not be negative')
+        if limit == 0:
+            # An empty page, no matter the offset. Don't scan for nothing.
+            return []
 
         # Index just past the last match the caller asked for. We never need
         # to look further than this.

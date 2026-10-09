@@ -643,6 +643,24 @@ To use the in-memory storage, use:
     user-controlled values for callable arguments (e.g. ``default`` or
     ``cls``) as they are executed in-process on every write operation.
 
+.. note::
+    ``JSONStorage`` never rewrites the database file in place. Each write goes
+    to a temporary file in the same directory that is flushed to disk and then
+    atomically swapped in, so if the process crashes or the disk fills up
+    mid-write, the file still contains the last successfully written state.
+    The file's permissions are kept (as are its owner and group, where the
+    process is allowed to set them), and a symlinked database path stays a
+    symlink.
+
+    Swapping in a new file needs write access to the database's directory,
+    and doesn't work if the file itself is a mount point (like a single-file
+    Docker bind mount). In those cases TinyDB writes in place as before and
+    emits a ``RuntimeWarning``.
+
+    If the process is killed in the middle of a write, a hidden
+    ``.<name>.<random>.tmp`` file may be left next to the database. TinyDB
+    never reads it, and it is safe to delete.
+
 To modify the default storage for all ``TinyDB`` instances, set the
 ``default_storage_class`` class variable:
 

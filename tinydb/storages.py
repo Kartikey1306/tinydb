@@ -3,14 +3,44 @@ Contains the :class:`base class <tinydb.storages.Storage>` for storages and
 implementations.
 """
 
-import io
+import contextlib
+import errno
 import json
 import os
+import stat
+import tempfile
 import warnings
 from abc import ABC, abstractmethod
 from typing import Any, Optional
 
 __all__ = ('Storage', 'JSONStorage', 'MemoryStorage')
+
+# Why JSONStorage couldn't swap in a new file (see JSONStorage.write)
+_MOUNT_POINT = 'it is a mount point'
+_DIRECTORY_NOT_WRITABLE = 'its directory is not writable'
+
+
+def _fsync_directory(path: str) -> None:
+    """
+    Flush changes to a directory's entries (like a rename) to disk.
+
+    Best effort: Windows can't open directories, and some filesystems don't
+    support fsync on them.
+    """
+    if os.name == 'nt':
+        return
+
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
 
 
 def touch(path: str, create_dirs: bool):
@@ -79,6 +109,11 @@ class Storage(ABC):
 class JSONStorage(Storage):
     """
     Store the data in a JSON file.
+
+    Writes are atomic: the new state is written to a temporary file next to
+    the database, which then replaces the database file. A crash or a full
+    disk during a write leaves the previous state intact instead of a
+    half-written file.
     """
 
     def __init__(self, path: str, create_dirs=False, encoding=None, access_mode='r+', **kwargs):
@@ -102,8 +137,19 @@ class JSONStorage(Storage):
 
         super().__init__()
 
+        self._path = os.fspath(path)
         self._mode = access_mode
+        self._encoding = encoding
         self.kwargs = kwargs
+
+        # Writes never go through our file handle, so after the first write
+        # it is reopened read-only. Reopening in a 'w' mode would truncate
+        # the file we just wrote.
+        self._read_mode = 'rb' if 'b' in access_mode else 'r'
+        # Cleared once the file turns out to be a mount point, which can never
+        # be replaced, so later writes go straight to the in-place fallback
+        self._can_replace = True
+        self._warned_in_place = False
 
         if access_mode not in ('r', 'rb', 'r+', 'rb+'):
             warnings.warn(
@@ -111,18 +157,44 @@ class JSONStorage(Storage):
                 'or \'rb+\' can cause data loss or corruption'
             )
 
+        # Any of the writing modes
+        self._writable = any(character in self._mode for character in ('+', 'w', 'a'))
+
         # Create the file if it doesn't exist and creating is allowed by the
         # access mode
-        if any([character in self._mode for character in ('+', 'w', 'a')]):  # any of the writing modes
-            touch(path, create_dirs=create_dirs)
+        if self._writable:
+            touch(self._path, create_dirs=create_dirs)
+
+        # Writes replace the file the path points to. Resolve symlinks once,
+        # so we replace the real file and keep the link intact.
+        self._target = os.path.realpath(self._path)
 
         # Open the file for reading/writing
-        self._handle = open(path, mode=self._mode, encoding=encoding)
+        self._handle = open(self._path, mode=self._mode, encoding=encoding)
+
+    def _reopen(self) -> None:
+        self._handle.close()
+        self._handle = open(self._target, mode=self._read_mode, encoding=self._encoding)
+
+    def _reopen_if_replaced(self) -> None:
+        # Another JSONStorage (in this or another process) may have swapped
+        # in a new file since ours was opened. Our handle still points at
+        # the old, now unlinked file, so follow the path to the current one.
+        try:
+            current = os.stat(self._target)
+        except FileNotFoundError:
+            return
+
+        opened = os.fstat(self._handle.fileno())
+        if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
+            self._reopen()
 
     def close(self) -> None:
         self._handle.close()
 
     def read(self) -> Optional[dict[str, dict[str, Any]]]:
+        self._reopen_if_replaced()
+
         # Get the file size by moving the cursor to the file end and reading
         # its location
         self._handle.seek(0, os.SEEK_END)
@@ -140,25 +212,144 @@ class JSONStorage(Storage):
             return json.load(self._handle)
 
     def write(self, data: dict[str, dict[str, Any]]):
-        # Move the cursor to the beginning of the file just in case
-        self._handle.seek(0)
+        # Writes no longer go through our file handle, so its access mode
+        # doesn't stop them for us
+        if not self._writable:
+            raise IOError('Cannot write to the database. Access mode is "{0}"'.format(self._mode))
 
         # Serialize the database state using the user-provided arguments
         serialized = json.dumps(data, **self.kwargs)
 
-        # Write the serialized data to the file
+        # Never modify the database file in place: if the process dies or the
+        # disk fills up halfway through, the file is left truncated or with
+        # stale bytes at the end and can't be parsed anymore. Write the new
+        # state to a temporary file first, make sure it has reached the disk
+        # and then swap it in with os.replace(), which is atomic. The file
+        # always holds either the complete old or the complete new state.
+        reason: Optional[str] = _MOUNT_POINT
+        if self._can_replace:
+            reason = self._write_atomically(serialized)
+            if reason is None:
+                # Warn again if a later write has to fall back once more
+                self._warned_in_place = False
+                return
+
+            # A mount point stays one, so don't pay for a temporary file on
+            # every write from now on. A read-only directory may become
+            # writable again, and failing to create a file there is cheap,
+            # so keep trying in that case.
+            if reason == _MOUNT_POINT:
+                self._can_replace = False
+
+        # Warn (once) before writing anything: if warnings are turned into
+        # errors, the write is refused every time instead of silently going
+        # ahead in place on the next attempt
+        if not self._warned_in_place:
+            warnings.warn(
+                'Cannot replace {!r} atomically ({}). Writing in place '
+                'instead, so a crash during a write can corrupt it.'.format(
+                    self._path, reason),
+                RuntimeWarning,
+            )
+            self._warned_in_place = True
+
+        self._write_in_place(serialized)
+
+    def _write_atomically(self, serialized: str) -> Optional[str]:
+        """
+        Swap in a new file holding ``serialized``.
+
+        Returns ``None`` on success. If the database file can't be replaced,
+        returns why, and nothing has been changed.
+        """
+        # The temporary file has to be in the same directory: os.replace()
+        # can't move files between filesystems. mkstemp() gives it a unique,
+        # unpredictable name and creates it exclusively, so two databases
+        # never share a temporary file and nothing can be planted in its
+        # place.
+        directory = os.path.dirname(self._target)
         try:
-            self._handle.write(serialized)
-        except io.UnsupportedOperation:
-            raise IOError('Cannot write to the database. Access mode is "{0}"'.format(self._mode))
+            fd, tmp_path = tempfile.mkstemp(
+                dir=directory,
+                prefix='.{}.'.format(os.path.basename(self._target)),
+                suffix='.tmp',
+            )
+        except PermissionError:
+            # The database file is writable, but its directory isn't
+            return _DIRECTORY_NOT_WRITABLE
 
-        # Ensure the file has been written
-        self._handle.flush()
-        os.fsync(self._handle.fileno())
+        try:
+            with open(fd, 'w', encoding=self._encoding) as tmp:
+                tmp.write(serialized)
+                tmp.flush()
+                os.fsync(tmp.fileno())
 
-        # Remove data that is behind the new cursor in case the file has
-        # gotten shorter
-        self._handle.truncate()
+            self._copy_metadata(tmp_path)
+
+            # Windows refuses to replace a file that is still open, so release
+            # our handle for the swap. Reopen it whether or not the swap
+            # worked, so a failed write doesn't leave the storage unusable.
+            self._handle.close()
+            try:
+                os.replace(tmp_path, self._target)
+            finally:
+                self._handle = open(self._target, mode=self._read_mode,
+                                    encoding=self._encoding)
+        except BaseException as e:
+            # Don't leave a stray temporary file behind
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(tmp_path)
+
+            # A database file that is a mount point (like a single-file Docker
+            # bind mount) can be written to, but not replaced
+            if isinstance(e, OSError) and e.errno in (errno.EBUSY, errno.EXDEV):
+                return _MOUNT_POINT
+
+            raise
+
+        # Make the rename itself durable, not just the file contents
+        _fsync_directory(directory)
+
+        return None
+
+    def _copy_metadata(self, tmp_path: str) -> None:
+        """
+        Give the temporary file the database file's owner, group and mode.
+
+        mkstemp() creates it as 0600 and owned by us. Changing the owner
+        needs root and changing the group needs membership in it, so both are
+        best effort.
+        """
+        try:
+            st = os.stat(self._target)
+        except FileNotFoundError:
+            return
+
+        # chown() may clear setuid/setgid bits, so it goes first
+        if hasattr(os, 'chown'):
+            for uid, gid in ((st.st_uid, st.st_gid), (-1, st.st_gid)):
+                try:
+                    os.chown(tmp_path, uid, gid)
+                    break
+                except OSError:
+                    continue
+
+        os.chmod(tmp_path, stat.S_IMODE(st.st_mode))
+
+    def _write_in_place(self, serialized: str) -> None:
+        """
+        Overwrite the database file directly, for when it can't be replaced.
+
+        This is how all writes used to work. It isn't crash safe.
+        """
+        with open(self._target, 'r+', encoding=self._encoding) as f:
+            f.write(serialized)
+            f.flush()
+            os.fsync(f.fileno())
+
+            # Remove data that is behind the new cursor in case the file has
+            # gotten shorter
+            f.truncate()
 
 
 class MemoryStorage(Storage):

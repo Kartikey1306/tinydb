@@ -2,6 +2,7 @@
 Contains the :class:`base class <tinydb.middlewares.Middleware>` for
 middlewares and implementations.
 """
+import threading
 from typing import Optional
 
 from tinydb import Storage
@@ -140,3 +141,44 @@ class CachingMiddleware(Middleware):
         self.storage.close()
         self._closed = True
         self.cache = None
+
+
+class LockingMiddleware(Middleware):
+    """
+    Make a storage safe to share between threads.
+
+    TinyDB itself does no locking. When several threads use the same TinyDB
+    instance, their reads and writes interleave on the same storage, and
+    with :class:`~tinydb.storages.JSONStorage` they even share a single file
+    handle and cursor, which corrupts the database file.
+
+    This middleware serializes all access to the wrapped storage::
+
+        db = TinyDB('db.json', storage=LockingMiddleware(JSONStorage))
+
+    It can be combined with other middlewares. Put it outermost so the lock
+    also covers them::
+
+        storage = LockingMiddleware(CachingMiddleware(JSONStorage))
+
+    Note that this does not make TinyDB safe for use from multiple
+    *processes*.
+    """
+
+    def __init__(self, storage_cls):
+        # Initialize the parent constructor
+        super().__init__(storage_cls)
+
+        self._lock = threading.Lock()
+
+    def read(self):
+        with self._lock:
+            return self.storage.read()
+
+    def write(self, data):
+        with self._lock:
+            self.storage.write(data)
+
+    def close(self):
+        with self._lock:
+            self.storage.close()

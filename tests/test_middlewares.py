@@ -1,9 +1,10 @@
 import os
+import threading
 
 import pytest
 
 from tinydb import TinyDB
-from tinydb.middlewares import CachingMiddleware
+from tinydb.middlewares import CachingMiddleware, LockingMiddleware
 from tinydb.storages import MemoryStorage, JSONStorage
 
 doc = {'none': [None, None], 'int': 42, 'float': 3.1415899999999999,
@@ -121,3 +122,64 @@ def test_caching_rejects_use_after_close(tmpdir):
 
     with TinyDB(path, storage=CachingMiddleware(JSONStorage)) as reopened:
         assert reopened.all() == [{'key': 'value'}]
+
+
+def test_locking_read_write():
+    db = TinyDB(storage=LockingMiddleware(MemoryStorage))
+    db.insert({'key': 'value'})
+
+    assert db.all() == [{'key': 'value'}]
+
+
+def test_locking_nested_with_caching(tmpdir):
+    path = str(tmpdir.join('locked.db'))
+
+    with TinyDB(path,
+                storage=LockingMiddleware(CachingMiddleware(JSONStorage))) as db:
+        db.insert({'key': 'value'})
+
+    with TinyDB(path) as db:
+        assert db.all() == [{'key': 'value'}]
+
+
+def test_locking_concurrent_readers_and_writer(tmpdir):
+    # Without the lock, readers move the shared JSONStorage file cursor
+    # while the writer is writing, which corrupts reads and the file itself
+    path = str(tmpdir.join('locked.db'))
+    db = TinyDB(path, storage=LockingMiddleware(JSONStorage))
+    db.insert_multiple({'n': i} for i in range(100))
+
+    errors = []
+    done = threading.Event()
+
+    def reader():
+        while not done.is_set():
+            try:
+                assert len(db.all()) >= 100
+            except Exception as e:  # pragma: no cover
+                errors.append(e)
+
+    def writer():
+        try:
+            for i in range(100):
+                db.insert({'n': 100 + i})
+        except Exception as e:  # pragma: no cover
+            errors.append(e)
+        finally:
+            # Always release the readers, or a failing writer hangs the test
+            done.set()
+
+    threads = [threading.Thread(target=reader) for _ in range(4)]
+    threads.append(threading.Thread(target=writer))
+
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+    assert len(db) == 200
+    db.close()
+
+    with TinyDB(path) as reopened:
+        assert len(reopened) == 200

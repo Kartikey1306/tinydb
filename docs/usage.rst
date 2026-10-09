@@ -693,6 +693,27 @@ of these ways:
     # Using the close function
     db.close()
 
+LockingMiddleware
+^^^^^^^^^^^^^^^^^
+
+TinyDB does no locking of its own. If several threads share one ``TinyDB``
+instance, wrap the storage in a ``LockingMiddleware`` so their reads and
+writes don't interleave:
+
+>>> from tinydb.middlewares import LockingMiddleware
+>>> db = TinyDB('/path/to/db.json', storage=LockingMiddleware(JSONStorage))
+
+When combining it with other middleware, put it outermost so the lock covers
+them as well:
+
+>>> db = TinyDB('/path/to/db.json',
+...             storage=LockingMiddleware(CachingMiddleware(JSONStorage)))
+
+.. note::
+    ``LockingMiddleware`` protects against concurrent access from threads
+    within one process. It does not coordinate separate processes that open
+    the same database file.
+
 .. _mypy_type_checking:
 
 MyPy Type Checking

@@ -3,9 +3,9 @@ Contains the :class:`base class <tinydb.storages.Storage>` for storages and
 implementations.
 """
 
-import io
 import json
 import os
+import tempfile
 import warnings
 from abc import ABC, abstractmethod
 from typing import Any, Optional
@@ -79,6 +79,10 @@ class Storage(ABC):
 class JSONStorage(Storage):
     """
     Store the data in a JSON file.
+
+    Writes are atomic: the new state is written to a temporary file which
+    then replaces the database file, so a crash or a full disk during a
+    write leaves the previous state intact instead of a half-written file.
     """
 
     def __init__(self, path: str, create_dirs=False, encoding=None, access_mode='r+', **kwargs):
@@ -102,7 +106,9 @@ class JSONStorage(Storage):
 
         super().__init__()
 
+        self._path = os.fspath(path)
         self._mode = access_mode
+        self._encoding = encoding
         self.kwargs = kwargs
 
         if access_mode not in ('r', 'rb', 'r+', 'rb+'):
@@ -111,13 +117,16 @@ class JSONStorage(Storage):
                 'or \'rb+\' can cause data loss or corruption'
             )
 
+        # Any of the writing modes
+        self._writable = any(character in self._mode for character in ('+', 'w', 'a'))
+
         # Create the file if it doesn't exist and creating is allowed by the
         # access mode
-        if any([character in self._mode for character in ('+', 'w', 'a')]):  # any of the writing modes
-            touch(path, create_dirs=create_dirs)
+        if self._writable:
+            touch(self._path, create_dirs=create_dirs)
 
         # Open the file for reading/writing
-        self._handle = open(path, mode=self._mode, encoding=encoding)
+        self._handle = open(self._path, mode=self._mode, encoding=encoding)
 
     def close(self) -> None:
         self._handle.close()
@@ -140,25 +149,33 @@ class JSONStorage(Storage):
             return json.load(self._handle)
 
     def write(self, data: dict[str, dict[str, Any]]):
-        # Move the cursor to the beginning of the file just in case
-        self._handle.seek(0)
+        # Writes no longer go through our file handle, so its access mode
+        # doesn't stop them for us
+        if not self._writable:
+            raise IOError('Cannot write to the database. Access mode is "{0}"'.format(self._mode))
 
         # Serialize the database state using the user-provided arguments
         serialized = json.dumps(data, **self.kwargs)
 
-        # Write the serialized data to the file
-        try:
-            self._handle.write(serialized)
-        except io.UnsupportedOperation:
-            raise IOError('Cannot write to the database. Access mode is "{0}"'.format(self._mode))
+        # Never modify the database file in place: if the process dies or the
+        # disk fills up halfway through, the file is left truncated or with
+        # stale bytes at the end and can't be parsed anymore. Write the new
+        # state to a temporary file first, make sure it has reached the disk
+        # and then swap it in with os.replace(), which is atomic. The file
+        # always holds either the complete old or the complete new state.
+        tmp_path = os.path.join(tempfile.gettempdir(),
+                                os.path.basename(self._path) + '.tmp')
 
-        # Ensure the file has been written
-        self._handle.flush()
-        os.fsync(self._handle.fileno())
+        with open(tmp_path, 'w', encoding=self._encoding) as tmp:
+            tmp.write(serialized)
+            tmp.flush()
+            os.fsync(tmp.fileno())
 
-        # Remove data that is behind the new cursor in case the file has
-        # gotten shorter
-        self._handle.truncate()
+        # Windows refuses to replace a file that is still open, so release
+        # our handle first and reopen it on the new file afterwards
+        self._handle.close()
+        os.replace(tmp_path, self._path)
+        self._handle = open(self._path, mode=self._mode, encoding=self._encoding)
 
 
 class MemoryStorage(Storage):

@@ -643,6 +643,12 @@ To use the in-memory storage, use:
     user-controlled values for callable arguments (e.g. ``default`` or
     ``cls``) as they are executed in-process on every write operation.
 
+.. note::
+    ``JSONStorage`` never rewrites the database file in place. Each write goes
+    to a temporary file that is flushed to disk and then atomically swapped in,
+    so if the process crashes or the disk fills up mid-write, the file still
+    contains the last successfully written state.
+
 To modify the default storage for all ``TinyDB`` instances, set the
 ``default_storage_class`` class variable:
 

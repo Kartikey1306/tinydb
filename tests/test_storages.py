@@ -1,3 +1,4 @@
+import errno
 import json
 import os
 import random
@@ -95,6 +96,45 @@ def test_json_read(tmpdir):
     with pytest.raises(IOError):
         db.insert({'c': 1})  # writing is not
     db.close()
+
+
+def test_json_write_failure_keeps_previous_state(tmpdir, monkeypatch):
+    path = str(tmpdir.join('test.db'))
+    storage = JSONStorage(path)
+    storage.write(doc)
+
+    # Fail after the new (shorter) state has been written out but before it
+    # is known to be on disk, like a dying disk or a crash would
+    def failing_fsync(fd):
+        raise OSError(errno.EIO, 'simulated I/O error')
+
+    monkeypatch.setattr(os, 'fsync', failing_fsync)
+    with pytest.raises(OSError):
+        storage.write({'_default': {}})
+    monkeypatch.undo()
+
+    # The database file must still hold the complete previous state
+    with open(path) as f:
+        assert json.load(f) == doc
+
+    storage.close()
+
+
+def test_json_storage_usable_across_writes(tmpdir):
+    # Every write swaps in a new file, so the storage must keep reading the
+    # current one rather than the file it opened initially
+    path = str(tmpdir.join('test.db'))
+    storage = JSONStorage(path)
+
+    for i in range(5):
+        data = {'_default': {str(n): {'n': n} for n in range(5 - i)}}
+        storage.write(data)
+        assert storage.read() == data
+
+    storage.close()
+
+    with open(path) as f:
+        assert json.load(f) == {'_default': {'0': {'n': 0}}}
 
 
 def test_create_dirs():

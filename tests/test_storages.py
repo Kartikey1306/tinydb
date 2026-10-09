@@ -264,6 +264,15 @@ def test_json_unwritable_directory_falls_back_to_in_place(tmpdir, monkeypatch):
 
     assert len(replaced) == 1
     assert storage.read() == doc
+
+    # A second read-only stretch warns again
+    os.chmod(str(tmpdir), 0o500)
+    try:
+        with pytest.warns(RuntimeWarning, match='not writable'):
+            storage.write({'_default': {}})
+    finally:
+        os.chmod(str(tmpdir), 0o700)
+
     storage.close()
 
 

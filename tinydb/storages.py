@@ -230,6 +230,8 @@ class JSONStorage(Storage):
         if self._can_replace:
             reason = self._write_atomically(serialized)
             if reason is None:
+                # Warn again if a later write has to fall back once more
+                self._warned_in_place = False
                 return
 
             # A mount point stays one, so don't pay for a temporary file on

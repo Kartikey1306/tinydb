@@ -418,6 +418,13 @@ def test_update_multiple_overlapping_conditions(db: TinyDB):
     assert db.count(where('flag').exists()) == 1
 
 
+def test_update_multiple_no_match(db: TinyDB):
+    # Nothing to apply, or nothing matching: no IDs and no changes
+    assert db.update_multiple(iter([])) == []
+    assert db.update_multiple([({'int': 9}, where('char') == 'z')]) == []
+    assert db.count(where('int') == 9) == 0
+
+
 def test_upsert(db: TinyDB):
     assert len(db) == 3
 

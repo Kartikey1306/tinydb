@@ -125,13 +125,16 @@ class TinyDB(TableBase):
         :param kwargs: Keyword arguments to pass to the table class constructor
         """
 
-        if name in self._tables:
-            return self._tables[name]
+        # Two threads asking for a new table at once must get the same
+        # instance, or each would track its own next document ID
+        with self._storage_lock():
+            if name in self._tables:
+                return self._tables[name]
 
-        table = self.table_class(self.storage, name, **kwargs)
-        self._tables[name] = table
+            table = self.table_class(self.storage, name, **kwargs)
+            self._tables[name] = table
 
-        return table
+            return table
 
     def tables(self) -> set[str]:
         """

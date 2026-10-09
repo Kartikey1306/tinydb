@@ -1,11 +1,13 @@
 import os
 import threading
+import time
 
 import pytest
 
 from tinydb import TinyDB, where
 from tinydb.middlewares import CachingMiddleware, LockingMiddleware
 from tinydb.operations import increment
+from tinydb.table import Table
 from tinydb.storages import MemoryStorage, JSONStorage
 
 doc = {'none': [None, None], 'int': 42, 'float': 3.1415899999999999,
@@ -262,3 +264,21 @@ def test_locking_covers_forwarded_methods():
     thread.join()
     assert flushed.is_set()
     assert storage.storage.storage.memory == {'_default': {'1': {'key': 'value'}}}
+
+
+def test_locking_table_creation():
+    # A slow Table constructor widens the window between "is this table
+    # known?" and "remember it", so unlocked threads would each create one
+    class SlowTable(Table):
+        def __init__(self, *args, **kwargs):
+            time.sleep(0.05)
+            super().__init__(*args, **kwargs)
+
+    class SlowDB(TinyDB):
+        table_class = SlowTable
+
+    db = SlowDB(storage=LockingMiddleware(MemoryStorage))
+    tables = []
+
+    assert _run_threads(lambda n: tables.append(db.table('shared')), 4) == []
+    assert len({id(table) for table in tables}) == 1

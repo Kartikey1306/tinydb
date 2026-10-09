@@ -2,6 +2,7 @@ import errno
 import json
 import os
 import random
+import stat
 import tempfile
 
 import pytest
@@ -135,6 +136,126 @@ def test_json_storage_usable_across_writes(tmpdir):
 
     with open(path) as f:
         assert json.load(f) == {'_default': {'0': {'n': 0}}}
+
+
+def test_json_failed_write_cleans_up(tmpdir, monkeypatch):
+    path = str(tmpdir.join('test.db'))
+    storage = JSONStorage(path)
+    storage.write(doc)
+
+    def failing_fsync(fd):
+        raise OSError(errno.ENOSPC, 'simulated full disk')
+
+    monkeypatch.setattr(os, 'fsync', failing_fsync)
+    with pytest.raises(OSError):
+        storage.write({'_default': {}})
+    monkeypatch.undo()
+
+    # No temporary file is left behind, and the storage is still usable
+    assert os.listdir(str(tmpdir)) == ['test.db']
+    assert storage.read() == doc
+    storage.close()
+
+
+def test_json_failed_replace_keeps_storage_usable(tmpdir, monkeypatch):
+    path = str(tmpdir.join('test.db'))
+    storage = JSONStorage(path)
+    storage.write(doc)
+
+    def cross_device(src, dst):
+        raise OSError(errno.EXDEV, os.strerror(errno.EXDEV))
+
+    monkeypatch.setattr(os, 'replace', cross_device)
+    with pytest.raises(OSError):
+        storage.write({'_default': {}})
+    monkeypatch.undo()
+
+    assert storage.read() == doc
+    assert os.listdir(str(tmpdir)) == ['test.db']
+
+    storage.write({'_default': {}})
+    assert storage.read() == {'_default': {}}
+    storage.close()
+
+
+def test_json_temp_file_next_to_database(tmpdir, monkeypatch):
+    path = str(tmpdir.join('test.db'))
+    storage = JSONStorage(path)
+    sources = []
+
+    real_replace = os.replace
+
+    def recording_replace(src, dst):
+        sources.append(src)
+        real_replace(src, dst)
+
+    monkeypatch.setattr(os, 'replace', recording_replace)
+    storage.write(doc)
+    storage.close()
+
+    # Same directory (and so the same filesystem) as the database, with a
+    # name that isn't predictable
+    assert os.path.dirname(sources[0]) == str(tmpdir)
+    assert sources[0] != path + '.tmp'
+
+
+@pytest.mark.skipif(os.name == 'nt', reason='POSIX permissions')
+def test_json_write_keeps_file_mode(tmpdir):
+    path = str(tmpdir.join('test.db'))
+    storage = JSONStorage(path)
+    storage.write(doc)
+
+    for mode in (0o600, 0o640):
+        os.chmod(path, mode)
+        storage.write(doc)
+        assert stat.S_IMODE(os.stat(path).st_mode) == mode
+
+    storage.close()
+
+
+@pytest.mark.skipif(not hasattr(os, 'symlink') or os.name == 'nt',
+                    reason='needs symlinks')
+def test_json_write_through_symlink(tmpdir):
+    real = str(tmpdir.join('real.db'))
+    link = str(tmpdir.join('link.db'))
+    with open(real, 'w'):
+        pass
+    os.symlink(real, link)
+
+    storage = JSONStorage(link)
+    storage.write(doc)
+    storage.close()
+
+    # The link is kept and the data ends up in the file it points to
+    assert os.path.islink(link)
+    with open(real) as f:
+        assert json.load(f) == doc
+
+
+def test_json_write_mode_w_keeps_data(tmpdir):
+    path = str(tmpdir.join('test.db'))
+    with pytest.warns(UserWarning):
+        storage = JSONStorage(path, access_mode='w')
+    storage.write(doc)
+    storage.close()
+
+    with open(path) as f:
+        assert json.load(f) == doc
+
+
+def test_json_sees_writes_from_other_instance(tmpdir):
+    path = str(tmpdir.join('test.db'))
+    writer = JSONStorage(path)
+    reader = JSONStorage(path)
+
+    writer.write(doc)
+    assert reader.read() == doc
+
+    writer.write({'_default': {}})
+    assert reader.read() == {'_default': {}}
+
+    writer.close()
+    reader.close()
 
 
 def test_create_dirs():

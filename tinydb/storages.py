@@ -3,14 +3,39 @@ Contains the :class:`base class <tinydb.storages.Storage>` for storages and
 implementations.
 """
 
+import contextlib
 import json
 import os
+import shutil
 import tempfile
 import warnings
 from abc import ABC, abstractmethod
 from typing import Any, Optional
 
 __all__ = ('Storage', 'JSONStorage', 'MemoryStorage')
+
+
+def _fsync_directory(path: str) -> None:
+    """
+    Flush changes to a directory's entries (like a rename) to disk.
+
+    Best effort: Windows can't open directories, and some filesystems don't
+    support fsync on them.
+    """
+    if os.name == 'nt':
+        return
+
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
 
 
 def touch(path: str, create_dirs: bool):
@@ -80,9 +105,10 @@ class JSONStorage(Storage):
     """
     Store the data in a JSON file.
 
-    Writes are atomic: the new state is written to a temporary file which
-    then replaces the database file, so a crash or a full disk during a
-    write leaves the previous state intact instead of a half-written file.
+    Writes are atomic: the new state is written to a temporary file next to
+    the database, which then replaces the database file. A crash or a full
+    disk during a write leaves the previous state intact instead of a
+    half-written file.
     """
 
     def __init__(self, path: str, create_dirs=False, encoding=None, access_mode='r+', **kwargs):
@@ -111,6 +137,11 @@ class JSONStorage(Storage):
         self._encoding = encoding
         self.kwargs = kwargs
 
+        # Writes never go through our file handle, so after the first write
+        # it is reopened read-only. Reopening in a 'w' mode would truncate
+        # the file we just wrote.
+        self._read_mode = 'rb' if 'b' in access_mode else 'r'
+
         if access_mode not in ('r', 'rb', 'r+', 'rb+'):
             warnings.warn(
                 'Using an `access_mode` other than \'r\', \'rb\', \'r+\' '
@@ -125,13 +156,36 @@ class JSONStorage(Storage):
         if self._writable:
             touch(self._path, create_dirs=create_dirs)
 
+        # Writes replace the file the path points to. Resolve symlinks once,
+        # so we replace the real file and keep the link intact.
+        self._target = os.path.realpath(self._path)
+
         # Open the file for reading/writing
         self._handle = open(self._path, mode=self._mode, encoding=encoding)
+
+    def _reopen(self) -> None:
+        self._handle.close()
+        self._handle = open(self._target, mode=self._read_mode, encoding=self._encoding)
+
+    def _reopen_if_replaced(self) -> None:
+        # Another JSONStorage (in this or another process) may have swapped
+        # in a new file since ours was opened. Our handle still points at
+        # the old, now unlinked file, so follow the path to the current one.
+        try:
+            current = os.stat(self._target)
+        except FileNotFoundError:
+            return
+
+        opened = os.fstat(self._handle.fileno())
+        if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
+            self._reopen()
 
     def close(self) -> None:
         self._handle.close()
 
     def read(self) -> Optional[dict[str, dict[str, Any]]]:
+        self._reopen_if_replaced()
+
         # Get the file size by moving the cursor to the file end and reading
         # its location
         self._handle.seek(0, os.SEEK_END)
@@ -163,19 +217,47 @@ class JSONStorage(Storage):
         # state to a temporary file first, make sure it has reached the disk
         # and then swap it in with os.replace(), which is atomic. The file
         # always holds either the complete old or the complete new state.
-        tmp_path = os.path.join(tempfile.gettempdir(),
-                                os.path.basename(self._path) + '.tmp')
+        #
+        # The temporary file has to be in the same directory: os.replace()
+        # can't move files between filesystems. mkstemp() gives it a unique,
+        # unpredictable name and creates it exclusively, so two databases
+        # never share a temporary file and nothing can be planted in its
+        # place.
+        directory = os.path.dirname(self._target)
+        fd, tmp_path = tempfile.mkstemp(
+            dir=directory,
+            prefix='.{}.'.format(os.path.basename(self._target)),
+            suffix='.tmp',
+        )
 
-        with open(tmp_path, 'w', encoding=self._encoding) as tmp:
-            tmp.write(serialized)
-            tmp.flush()
-            os.fsync(tmp.fileno())
+        try:
+            with open(fd, 'w', encoding=self._encoding) as tmp:
+                tmp.write(serialized)
+                tmp.flush()
+                os.fsync(tmp.fileno())
 
-        # Windows refuses to replace a file that is still open, so release
-        # our handle first and reopen it on the new file afterwards
-        self._handle.close()
-        os.replace(tmp_path, self._path)
-        self._handle = open(self._path, mode=self._mode, encoding=self._encoding)
+            # mkstemp() creates the file as 0600. Carry over the database's
+            # permissions so that the swap doesn't change them.
+            with contextlib.suppress(FileNotFoundError):
+                shutil.copymode(self._target, tmp_path)
+
+            # Windows refuses to replace a file that is still open, so release
+            # our handle for the swap. Reopen it whether or not the swap
+            # worked, so a failed write doesn't leave the storage unusable.
+            self._handle.close()
+            try:
+                os.replace(tmp_path, self._target)
+            finally:
+                self._handle = open(self._target, mode=self._read_mode,
+                                    encoding=self._encoding)
+        except BaseException:
+            # Don't leave a stray temporary file behind
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(tmp_path)
+            raise
+
+        # Make the rename itself durable, not just the file contents
+        _fsync_directory(directory)
 
 
 class MemoryStorage(Storage):

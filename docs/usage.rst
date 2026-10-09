@@ -645,9 +645,15 @@ To use the in-memory storage, use:
 
 .. note::
     ``JSONStorage`` never rewrites the database file in place. Each write goes
-    to a temporary file that is flushed to disk and then atomically swapped in,
-    so if the process crashes or the disk fills up mid-write, the file still
-    contains the last successfully written state.
+    to a temporary file in the same directory that is flushed to disk and then
+    atomically swapped in, so if the process crashes or the disk fills up
+    mid-write, the file still contains the last successfully written state.
+    The file's permissions are kept, and a symlinked database path stays a
+    symlink.
+
+    If the process is killed in the middle of a write, a hidden
+    ``.<name>.<random>.tmp`` file may be left next to the database. TinyDB
+    never reads it, and it is safe to delete.
 
 To modify the default storage for all ``TinyDB`` instances, set the
 ``default_storage_class`` class variable:

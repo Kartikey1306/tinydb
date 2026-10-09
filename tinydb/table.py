@@ -246,9 +246,21 @@ class Table:
 
         return list(iter(self))
 
-    def search(self, cond: QueryLike) -> list[Document]:
+    def search(
+        self,
+        cond: QueryLike,
+        limit: Optional[int] = None,
+        offset: int = 0,
+    ) -> list[Document]:
         """
         Search for all documents matching a 'where' cond.
+
+        Matches are returned in insertion order. Use ``limit`` and ``offset``
+        to fetch one page of a large result set. The scan stops as soon as
+        the requested page is complete, so early pages are cheap even on
+        big tables::
+
+            >>> db.search(User.active == True, limit=25, offset=50)
 
         Note: a repeated search with the same ``cond`` is served from an
         internal cache. The returned list is a fresh copy, but its
@@ -257,23 +269,50 @@ class Table:
         what a later identical search returns.
 
         :param cond: the condition to check against
+        :param limit: the maximum number of documents to return, or ``None``
+                      to return every match
+        :param offset: the number of matching documents to skip
         :returns: list of matching documents
         """
+        if offset < 0:
+            raise ValueError('offset must not be negative')
+        if limit is not None and limit < 0:
+            raise ValueError('limit must not be negative')
+        if limit == 0:
+            # An empty page, no matter the offset. Don't scan for nothing.
+            return []
+
+        # Index just past the last match the caller asked for. We never need
+        # to look further than this.
+        end = offset + limit if limit is not None else None
 
         # First, we check the query cache to see if it has results for this
         # query
         cached_results = self._query_cache.get(cond)
         if cached_results is not None:
-            return cached_results[:]
+            return cached_results[offset:end]
 
-        # Perform the search by applying the query to all documents.
-        # Then, only if the document matches the query, convert it
-        # to the document class and document ID class.
-        docs = [
-            self.document_class(doc, self.document_id_class(doc_id))
-            for doc_id, doc in self._read_table().items()
-            if cond(doc)
-        ]
+        # Perform the search by applying the query to the documents in
+        # insertion order. Only matching documents are converted to the
+        # document class and document ID class, and we stop once the
+        # requested page is filled.
+        docs: list[Document] = []
+
+        # Whether every document was looked at. A scan that stopped early
+        # only holds the first ``end`` matches, so it must not end up in the
+        # query cache, where later searches would take it for the full
+        # result.
+        complete = True
+
+        for doc_id, doc in self._read_table().items():
+            if end is not None and len(docs) >= end:
+                complete = False
+                break
+
+            if cond(doc):
+                docs.append(
+                    self.document_class(doc, self.document_id_class(doc_id))
+                )
 
         # Only cache cacheable queries.
         #
@@ -290,11 +329,11 @@ class Table:
         # are cacheable.
         is_cacheable: Callable[[], bool] = getattr(cond, 'is_cacheable',
                                                    lambda: True)
-        if is_cacheable():
+        if complete and is_cacheable():
             # Update the query cache
             self._query_cache[cond] = docs[:]
 
-        return docs
+        return docs[offset:end]
 
     @overload
     def get(self) -> NoReturn: ...

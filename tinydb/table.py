@@ -537,9 +537,11 @@ class Table:
         """
         Update all matching documents to have a given set of fields.
 
-        Every ``(fields, cond)`` pair is checked against every document. A
-        document matching several conditions has each matching update
-        applied (in the given order) but is only reported once.
+        For every document, the ``(fields, cond)`` pairs are tried in the
+        given order, and each ``cond`` sees the document as left by the
+        updates before it. An earlier update can therefore make a later
+        condition match or stop matching. A document updated by several
+        pairs is reported once.
 
         :returns: a list containing the updated document's ID
         """
